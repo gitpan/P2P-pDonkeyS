@@ -1,0 +1,46 @@
+P2P::pDonkeyS version 0.01
+==========================
+
+pDonkeyS is perl implementation of eDonkey server. It is built upon
+"Net::Server::Multiplex" and utilizes the power of MySQL for storing,
+fetching and searching shares.
+
+The main goal of the server is to provide framework for further eDonkey
+protocol exploration, but it could be usefull in testing of client
+software, since the server can be configured to output very detailed
+debug info about eDonkey traffic.
+
+
+INSTALLATION
+
+  To install this module type the following:
+
+    perl Makefile.PL
+    make
+    make test
+    make install
+    mysql -u root -p <makedb.sql
+
+DEPENDENCIES
+
+  This module requires these other modules and libraries:
+
+    DBI
+    Socket
+    Fcntl
+    Data::Hexdumper
+    Tie::RefHash
+    Sys::Hostname
+    LWP::UserAgent
+    P2P::pDonkey
+
+  Also it requires MySQL 4.0 or greater to run. MySQL can be obtained
+from <http://www.mysql.com/>.
+
+COPYRIGHT AND LICENCE
+
+    Copyright (c) 2003 Alexey klimkin <klimkin at cpan.org>. 
+    All rights reserved.
+    This program is free software; you can redistribute it and/or
+    modify it under the same terms as Perl itself.
+

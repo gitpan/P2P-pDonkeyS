@@ -1,0 +1,9 @@
+dropdb.sql
+makedb.sql
+Makefile.PL
+MANIFEST
+pdonkeys
+pdonkeys.conf
+udptest.pl
+Changes
+README

@@ -1,0 +1,993 @@
+#! /usr/bin/perl -w
+
+package P2P::pDonkeyS;
+
+use strict;
+use Net::Server::Multiplex;
+use vars qw(@ISA);
+@ISA = qw(Net::Server::Multiplex);
+
+our $VERSION = '0.01';
+
+use DBI;
+use Socket;
+use Fcntl;
+use Data::Hexdumper;
+use Tie::RefHash;
+use Sys::Hostname;
+use LWP::UserAgent;
+use P2P::pDonkey::Met ':all';
+use P2P::pDonkey::Meta ':all';
+use P2P::pDonkey::Packet ':all';
+
+use constant MAX_ClientID   => 16777215;
+
+use constant DBG_NONE       => 0x0;
+use constant DBG_HEXDUMP    => 0x1;
+use constant DBG_PRINTINFO  => 0x2;
+
+#### defaults are set in post_configure_hook()
+my $debug = DBG_NONE;   # debug level
+
+# configurable parameters
+my $tcpPort = 4661;
+my $udpPort = $tcpPort + 4;
+my $thisIP;     # server ip
+my $maxClients; # maximum number of connected clients, low client ids should be less then 16777215
+my $serverName; # server name
+my $serverDesc; # server description
+my $welcome;    # greetings screen
+my $statusTimeout;  # period to update server status
+my $dbName;     # database source
+my $dbUser;     # database user
+my $dbAuth;     # database auth password
+
+### internal data
+my $nUsers;     # number of users online
+my $nFiles;     # number of files in database
+my $serverInfo; # server info in edk2 format
+my %IDS;        # hash of low ids for search of unused one
+my $ID_last;    # the last assigned low id
+my %cbits;      # stores information for clients (like $cbits{$fh}{obj})
+my %ip2fh;      # store/get file handle from client id
+my @serverList;         # server list sent to clients by request
+my @serverMetURL;       # list of urls where get server.met from
+my $serverListTimeout;  # interval between server.met updates
+my $dbh;        # database handle
+## here goes prepared sql queries
+my ($sth_client_select, # select client by ip and port to @cid
+    $sth_client_insert, # insert new client
+    $sth_client_set);   # set @cid to client with ip and port
+my ($sth_file_select,   # select file by hash, size and name to @fid
+    $sth_file_insert,   # insert new file
+    $sth_file_set,      # set @fid to file with hash, size and name
+    $sth_file_inc);     # increment availability count of file @fid
+my ($sth_link_insert,   # insert link between @fid and @cid
+    $sth_get_sources,   # select <256 least used clients by file hash
+    $sth_update_stamp); # update timestamp for specified client cid
+my ($sth_file_dec,      # decrement availability for all files of client
+    $sth_delete,        # delete client entries on disconnect
+    $sth_file_count);   # count the number of files
+my @procTable;          # array of packet processing functions
+$procTable[PT_HELLOSERVER]  = \&processHello;
+$procTable[PT_OFFERFILES]   = \&processOfferFiles;
+$procTable[PT_SEARCHFILE]   = \&processSearchFile;
+$procTable[PT_GETSOURCES]   = \&processGetSources;
+$procTable[PT_GETSERVERLIST]= \&processGetServerList;
+$procTable[PT_CLIENTCBREQ]  = \&processClientCallbackRequest;
+$procTable[PT_UDP_SERVERSTATUSREQ]  = \&processUDPStatusReq;
+$procTable[PT_UDP_SEARCHFILE]       = \&processUDPSearchFile;
+$procTable[PT_UDP_GETSOURCES]       = \&processUDPGetSources;
+$procTable[PT_UDP_GETSERVERLIST]    = \&processUDPGetServerList;
+$procTable[PT_UDP_GETSERVERINFO]    = \&processUDPGetServerInfo;
+$procTable[PT_UDP_CBREQUEST]        = \&processUDPCallbackRequest;
+
+__PACKAGE__->run(port => "$tcpPort/tcp",
+                 port => "$udpPort/udp");
+#                 conf_file => 'pdonkeys.conf');
+exit;
+
+###############################################################################
+# Utility
+###############################################################################
+
+sub Send {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my $server = $self->{net_server};
+    my $pt = $_[0];
+    my $body;
+
+    defined($body = &packBody) or return;
+    my $plen = length $body;
+    
+    print STDERR hexdump(data => packTCPHeader($plen) . $body) 
+        if $debug & DBG_HEXDUMP;
+    $server->log(4, sprintf("$self->{peeraddr}:$self->{peerport} <- %s(0x%02x) [%d]\n", PacketTagName($pt), $pt, $plen));
+   
+    $mux->write($fh, packTCPHeader($plen) . $body);
+}
+
+sub SendUDP {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my $server = $self->{net_server};
+    my $pt = $_[0];
+    my $body;
+    
+    defined($body = &packBody) or return;
+    my $plen = length $body;
+    
+    print STDERR hexdump(data => packUDPHeader() . $body) 
+        if $debug & DBG_HEXDUMP;
+    $server->log(4, sprintf("$self->{peeraddr}:$self->{peerport} <- %s(0x%02x) [%d]\n", PacketTagName($pt), $pt, $plen));
+
+    $mux->write($fh, packUDPHeader($plen) . $body);
+}
+
+sub nonblock
+{
+    my $fh = shift;
+    my $flags = fcntl($fh, F_GETFL, 0)
+        or die "fcntl F_GETFL: $!\n";
+    fcntl($fh, F_SETFL, $flags | O_NONBLOCK)
+        or die "fcntl F_SETFL: $!\n";
+}
+
+sub GetLowClientID {
+    while ($IDS{$ID_last})
+    {
+        $ID_last++;
+        $ID_last = 0 if $ID_last > MAX_ClientID;
+    }
+    $IDS{$ID_last} = 1;
+    return $ID_last;
+}
+
+sub ProcessInput {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my $data = shift;
+    my $server = $self->{net_server};
+
+    my @d;
+    my ($pt, $plen);
+    my $off = 0;
+
+    if (exists $self->{session}) {
+        ######### TCP ########
+        $plen = $self->{PLen};
+
+        #### read and construct packet from data parts if necessary
+        if ($plen > 0) {
+            # process next part of packet
+            $$data = $self->{Buffer} . $$data;
+            my $datalen = length $$data;
+            if ($plen <= $datalen) {
+                @d = unpackBody(\$pt, $$data, $off);
+                $self->{PLen} = 0;
+                $self->{Buffer} = '';
+                $$data = unpack("x$plen a*", $$data);
+            } else {
+                $self->{Buffer} = $$data;
+                $$data = '';
+            }
+
+        } elsif ($plen = unpackTCPHeader($$data, $off)) {
+            # process first part of packet
+            $$data = unpack("x$off a*", $$data);
+            $off = 0;
+            my $datalen = length $$data;
+            if ($plen <= $datalen) {
+                @d = unpackBody(\$pt, $$data, $off);
+                $$data = unpack("x$plen a*", $$data);
+            } else {
+                $self->{Buffer} = $$data;
+                $self->{PLen} = $plen;
+                $$data = '';
+            }
+
+        } else {
+            $$data = '';
+        }
+
+    } elsif ($mux->is_udp($fh)) {
+        ######### UDP ########
+        if (unpackUDPHeader($$data, $off)) {
+            @d = unpackBody(\$pt, $$data, $off);
+            $plen = $off - 1;
+        }
+        $$data = '';
+        my ($port, $iaddr) = sockaddr_in($mux->udp_peer($fh));
+        $self->{peeraddr}  = inet_ntoa($iaddr);
+        $self->{peerport}  = $port;
+    }
+
+    if ($$data) {
+        print STDERR hexdump(data => $$data) if $debug & DBG_HEXDUMP;
+    }
+    #### process unpacked data
+    if (@d) {
+        $server->log(4, sprintf("$self->{peeraddr}:$self->{peerport} -> %s(0x%02x) [%d]\n",
+                                PacketTagName($pt), $pt, $plen));
+        my $f = $procTable[$pt];
+        if ($f) {
+#if ($off != $fplen) {
+#                LOG $self, ": there are left ", $fplen - $off, " unpacked bytes in packet\n";
+#           }
+            &$f($self, $mux, $fh, @d);
+        } else {
+            $server->log(3, sprintf("$self->{peeraddr}:$self->{peerport}: dropped: no processing function for 0x%02x\n", $pt));
+        }
+    } elsif (defined $pt) {
+        $server->log(3, sprintf("$self->{peeraddr}:$self->{peerport}: dropped: incorrect packet format for 0x%02x\n", $pt));
+    }
+
+    return $pt;
+}
+
+###############################################################################
+# Server hooks
+###############################################################################
+### set up some server parameters
+sub post_configure_hook {
+    my $self = shift;
+    my $prop = $self->{server};
+    
+    # reset server data
+    %IDS = ();
+    ($nUsers, $nFiles, $ID_last) = (0, 0, 1);
+
+    $debug |= DBG_HEXDUMP if $prop->{log_level} >= 5;
+    
+    # parse config file, join strings from welcome argument
+    my %conf;
+    for (@{$self->{server}->{conf_file_args}}) {
+        if      (/(welcome)=(.*)/) {
+            $conf{$1} and $conf{$1} .= "\n$2"
+                or $conf{$1} = $2;
+        } elsif (/([^=]+)=(.*)/) {
+            $conf{$1} = $2;
+        }
+    }
+
+    # setup some options
+    $serverName = $conf{name} ? $conf{name} : "pDonkeyS";
+    $serverDesc = $conf{desc} ? $conf{desc} : "eDonkey server in Perl v$VERSION";
+    $maxClients = $conf{maxClients} ? $conf{maxClients} : 6000;
+    $statusTimeout = $conf{statusTimeout} ? $conf{statusTimeout} : 60;
+    $welcome = $conf{welcome} ? $conf{welcome} : <<END;
+------------------------------------------
+      Welcome to pDonkey Server v$VERSION!
+             P2P::pDonkey v$P2P::pDonkey::Packet::VERSION
+ http://sourceforge.net/projects/pdonkey/
+------------------------------------------
+END
+
+    # setup server info for PT_SERVERINFODATA packets
+    $thisIP = unpack('L', $conf{thisIP} 
+                     ? inet_aton($conf{thisIP}) 
+                     : gethostbyname(hostname())
+                    );
+    $serverInfo = makeServerInfo($thisIP, $tcpPort, $serverName, $serverDesc);
+
+    # connect to database, clear tables, create new tables and prepare requests
+    $dbName = $conf{dbName} ? $conf{dbName} : "dbi:mysql:pDonkey";
+    $dbUser = $conf{dbUser} ? $conf{dbUser} : "pDonkeyS";
+    $dbAuth = $conf{dbAuth} ? $conf{dbAuth} : "pDonkeySPass";
+    dbConnect();
+    dbDropTables();
+    dbCreateTables();
+    dbPrepare();
+
+    # read list of server.met sources and setup alarm signal
+    $serverListTimeout = $conf{serverListTimeout} ? $conf{serverListTimeout} : 60*60*24;    # once a day
+    @serverMetURL = ();
+    for (@{$self->{server}->{conf_file_args}}) {
+        /serverMet=(.*)/ and push @serverMetURL, $1;
+    }
+    my $LoadMetList = $SIG{ALRM} = sub {
+        my @slist;
+        my %slist_uniq;
+
+        my $ua = LWP::UserAgent->new(env_proxy => 1, timeout => 10);
+        $ua->no_proxy('localhost');
+
+        for (@serverMetURL) {
+            $self->log(3, $self->log_time . " Loading 'server.met' from '$_' ...\n");
+            my $res = $ua->get($_);
+            if ($res->is_success) {
+                my $off = 0;
+                my $smet = unpackServerMet($res->content, $off);
+                if ($smet) {
+                    my $d;
+                    my $cnt = 0;
+                    while ((undef, $d) = each %$smet) {
+                        if (!defined $slist_uniq{"$d->{IP}:$d->{Port}"}) {
+                            $slist_uniq{"$d->{IP}:$d->{Port}"} = 1;
+                            push @slist, $d->{IP}, $d->{Port};
+                            $cnt++;
+                        }
+                    }
+                    $self->log(3, $self->log_time . "   got $cnt new servers so far.\n");
+                } else {
+                    $self->log(3, $self->log_time . "   bad 'server.met' format!\n");
+                }
+            } else {
+                $self->log(3, $self->log_time . "   " . $res->request->uri . ": " . $res->status_line . "\n");
+            }
+        }
+
+        alarm($serverListTimeout);
+    };
+    alarm($serverListTimeout);
+    &$LoadMetList();
+}
+
+## Demonstrate a Net::Server style hook
+sub allow_deny_hook {
+    my $self = shift;
+    my $prop = $self->{server};
+    my $sock = $prop->{client};
+
+    return 0 if $nUsers == $maxClients;
+#    return 1 if $prop->{peeraddr} =~ /^127\./;
+#    return 0;
+    return 1;
+}
+
+
+# Another Net::Server style hook
+sub request_denied_hook {
+    my $self = shift;
+    my $prop = $self->{server};
+#    print "Go away!\n";
+    if ($nUsers == $maxClients) {
+        $self->log(3, $self->log_time . " [$prop->{peeraddr}] Server full!\n");
+    } else {
+        $self->log(3, $self->log_time . " [$prop->{peeraddr}] Client denied!\n");
+    }
+}
+
+# Disconnect from database
+sub pre_server_close_hook {
+    dbDisconnect();
+}
+
+sub restart_close_hook {
+    dbDisconnect();
+}
+
+# IO::Multiplex style callback hook
+sub mux_connection {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my $server = $self->{net_server};
+
+    $self->{Buffer} = '';
+    $self->{PLen} = 0;
+# Net::Server stores a connection counter in the {requests} field.
+    $self->{session} = $self->{net_server}->{server}->{requests};
+# Keep some values that I might need while the {server}
+# property hash still contains the current client info
+# and stash them in my own object hash.
+    $self->{peerport} = $self->{net_server}->{server}->{peerport};
+
+    $server->log(3, $server->log_time
+                 . " Client [$self->{peeraddr}] (session $self->{session}) just connected...\n");
+    $nUsers++;
+}
+
+# If this callback is ever hooked, then the mux_connection callback
+# is guaranteed to have already been run once (if defined).
+sub mux_input {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+
+    # ommit processing connection check socket
+    return if $cbits{$fh}{Check};
+    
+    my $data = shift;  # Scalar reference to the input
+
+    print STDERR hexdump(data => $$data) if $debug & DBG_HEXDUMP;
+
+    while (defined $self->ProcessInput($mux, $fh, $data)) {}
+}
+
+
+# It is possible that this callback will be called even
+# if mux_connection or mux_input were never called.  This
+# occurs when allow_deny or allow_deny_hook fails to
+# authorize the client.  The callback object will be the
+# default listen object instead of a client unique object.
+# However, both object should contain the $self->{net_server}
+# key pointing to the original Net::Server object.
+sub mux_close {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+# If mux_connection has actually been run
+    if (exists $self->{session}) {
+        my $peer = $self->{peeraddr};
+        my $server = $self->{net_server};
+
+        $server->log(3, $server->log_time
+                     . " Client [$peer] (session $self->{session}) closed connection.\n");
+        $nUsers--;
+        $mux->set_timeout($fh, undef);
+        dbRemove($self->{IP}, $self->{Port});
+        delete $ip2fh{$self->{IP}};
+    }
+    delete $cbits{$fh};
+}
+
+sub mux_timeout {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    $self->Send($mux, $fh, PT_SERVERSTATUS, $nUsers, $nFiles);
+    $mux->set_timeout($fh, $statusTimeout);
+}
+
+sub mux_outbuffer_empty {
+    my $self = shift;
+    my $mux = shift;
+    my $fh = shift;
+    # now we know, reachable peer port or not
+    if ($cbits{$fh}{Check}) {
+        my $_self = $cbits{$fh}{obj};
+        my $_fh = $cbits{$fh}{fh};
+        my $sockaddr = getpeername($fh);
+        if ($sockaddr) {
+            $_self->{IP} = unpack('L', (sockaddr_in($sockaddr))[1]);
+        } else {
+            $_self->{IP} = GetLowClientID();
+        }
+        $mux->close($fh);
+        delete $cbits{$fh};
+        $_self->Proceed($mux, $_fh);
+    }
+}
+
+###############################################################################
+# Packet processing
+###############################################################################
+sub processHello {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($d) = @_;
+    if ($debug & DBG_PRINTINFO) {
+        my $tmpfd = *STDOUT;
+        *STDOUT = *STDERR;
+        printInfo($d);
+        *STDOUT = $tmpfd;
+    }
+    $self->{Hash} = $d->{Hash};
+    $self->{IP}   = $d->{IP};
+    $self->{Port} = $d->{Port};
+
+#my $addr = '10.0.0.1';#inet_ntoa(pack('L', $self->{IP}));
+    my $addr = $self->{peeraddr};
+    my $cb = new IO::Socket::INET(PeerAddr => "$addr:$self->{Port}",
+                                  Proto => 'tcp',
+                                  Blocking => 0);
+    if ($cb) {
+        # connection is in progress
+        $cbits{$cb}{Check} = 1;
+        $cbits{$cb}{obj} = $self;
+        $cbits{$cb}{fh} = $fh;
+        $mux->add($cb);
+        $mux->write($cb, '');
+    } else {
+        # peer port is not reachable, low id
+        $self->{IP} = GetLowClientID();
+        $self->Proceed($mux, $fh);
+    }
+}
+
+sub Proceed {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    $self->Send($mux, $fh, PT_IDCHANGE, $self->{IP});
+    $self->Send($mux, $fh, PT_SERVERINFODATA, $serverInfo);
+    $self->Send($mux, $fh, PT_SERVERMESSAGE, $welcome);
+    $ip2fh{$self->{IP}} = $fh;
+    $cbits{$fh}{obj} = $self;
+    # send PT_SERVERSTATUS every $statusTimeout seconds
+    $self->mux_timeout($mux, $fh);
+
+    my $server = $self->{net_server};
+    $server->log(3, $server->log_time
+                 . " Client [$self->{peeraddr}] (session $self->{session}) Granted id: $self->{IP}\n");
+}
+
+sub processGetServerList {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    $self->Send($mux, $fh, PT_SERVERLIST, \@serverList);
+}
+
+sub processOfferFiles {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($list) = @_;
+    dbAddFiles($self->{IP}, $self->{Port}, $list);
+}
+
+sub processSearchFile {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($q) = @_;
+    $self->Send($mux, $fh, PT_SEARCHFILERES, dbSearchFile($q), 0);
+}
+
+sub processGetSources {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($hash) = @_;
+    $self->Send($mux, $fh, PT_FOUNDSOURCES, $hash, dbGetSources($hash));
+}
+
+sub processClientCallbackRequest {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($cb_ip) = @_;
+
+    my $server = $self->{net_server};
+    $self->log(3, $self->log_time . " Requested callback from $cb_ip\n");
+
+    my $cb_fh = $ip2fh{$cb_ip};
+    if ($cb_fh && $self->{IP} > MAX_ClientID) {
+        $cbits{$cb_fh}{obj}->Send($mux, $cb_fh, PT_SERVERCBREQ, $self->{IP}, $self->{Port});
+    } else {
+        $self->Send($mux, $fh, PT_CBFAIL, $cb_ip);
+    }
+}
+
+sub processUDPStatusReq {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($v) = @_;
+    $self->SendUDP($mux, $fh, PT_UDP_SERVERSTATUS, $v, $nUsers, $nFiles);
+}
+
+sub processUDPSearchFile {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($q) = @_;
+    my $res = dbSearchFile($q, 1);
+    $self->SendUDP($mux, $fh, PT_UDP_SEARCHFILERES, shift @$res) if @$res;
+}
+
+sub processUDPGetSources {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($hash) = @_;
+    my $sources = dbGetSources($hash);
+    $self->SendUDP($mux, $fh, PT_UDP_FOUNDSOURCES, $hash, $sources) if @$sources;
+}
+
+sub processUDPGetServerList {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    $self->SendUDP($mux, $fh, PT_UDP_SERVERLIST, \@serverList);
+}
+
+sub processUDPGetServerInfo {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    $self->SendUDP($mux, $fh, PT_UDP_SERVERINFO, $serverName, $serverDesc);
+}
+
+sub processUDPCallbackRequest {
+    my $self = shift;
+    my $mux  = shift;
+    my $fh   = shift;
+    my ($ip, $port, $cb_ip) = @_;
+
+    my $server = $self->{net_server};
+    $self->log(3, $self->log_time 
+               . " Requested callback from $cb_ip to " 
+               . inet_ntoa(pack('L', $ip)) . ":$port\n");
+
+    my $cb_fh = $ip2fh{$cb_ip};
+    if ($cb_fh) {
+        $cbits{$cb_fh}{obj}->Send($mux, $cb_fh, PT_SERVERCBREQ, $ip, $port);
+    } else {
+        $self->SendUDP($mux, $fh, PT_UDP_CBFAIL, $cb_ip);
+    }
+}
+
+
+###############################################################################
+# Database access
+###############################################################################
+sub dbConnect {
+    $dbh = DBI->connect($dbName, $dbUser, $dbAuth, 
+                        { RaiseError => 1, AutoCommit => 1 });
+}
+
+sub dbDisconnect {
+    $dbh->disconnect if $dbh;
+}
+
+sub dbCreateTables {
+    $dbh->do(<<SQL);
+create table client (cid int unsigned not null auto_increment,
+                     ip int unsigned not null,
+                     port smallint unsigned not null,
+                     last_used timestamp,
+                     primary key (cid),
+                     index (ip, port))
+SQL
+    $dbh->do(<<SQL);
+create table file (fid int unsigned not null auto_increment,
+                   hash char(32) not null,
+                   size int unsigned not null,
+                   name varchar(80) not null,
+                   type varchar(10) null,
+                   format varchar(4) null,
+                   availability int unsigned not null,
+                   primary key (fid),
+                   index (hash),
+                   index (hash, size, name))
+SQL
+    $dbh->do(<<SQL);
+create table link (cid int unsigned not null,
+                   fid int unsigned not null,
+                   primary key (cid, fid))
+SQL
+}
+
+sub dbDropTables {
+    if ($dbh->do('show tables') > 0) {
+        $dbh->do('drop table file, client, link');
+    }
+}
+
+sub dbPrepare {
+    # queries on OfferFiles
+    $sth_client_select = $dbh->prepare('select @cid:=cid from client where ip = ? and port = ?');
+    $sth_client_insert = $dbh->prepare('insert into client values (NULL, ?, ?, NULL)');
+    $sth_client_set    = $dbh->prepare('set @cid = last_insert_id()');
+    $sth_file_select = $dbh->prepare('select @fid:=fid from file where hash = ? and size = ? and name = ?');
+    $sth_file_insert = $dbh->prepare('insert into file values (NULL, ?, ?, ?, ?, ?, 1)');
+    $sth_file_set    = $dbh->prepare('set @fid = last_insert_id()');
+    $sth_file_inc    = $dbh->prepare('update file set availability=availability+1 where fid = @fid');
+    $sth_link_insert = $dbh->prepare('insert ignore into link values (@cid, @fid)');
+    
+    # queries on Disconnect
+    $sth_file_dec = $dbh->prepare(<<SQL);
+update file, client, link 
+    set file.availability = file.availability - 1 
+    where client.ip = ? 
+        and client.port = ? 
+        and client.cid = link.cid 
+        and link.fid = file.fid
+SQL
+    $sth_delete = $dbh->prepare(<<SQL);
+delete client, file, link 
+    from client c, file f, link l 
+    where c.ip = ? 
+        and c.port = ? 
+        and c.cid = l.cid 
+        and f.availability = 0
+SQL
+
+    # queries on GetSources
+    $sth_get_sources = $dbh->prepare(<<SQL);
+select c.cid, c.ip, c.port
+    from client c, file f, link l 
+    where f.hash = ?
+        and f.fid = l.fid
+        and c.cid = l.cid
+    order by c.last_used
+    limit 255
+SQL
+    $sth_update_stamp = $dbh->prepare('update client set last_used=null where cid = ?');
+    $sth_file_count = $dbh->prepare('select count(*) from file');
+}
+
+sub dbAddFiles {
+    my $ip = shift;
+    my $port = shift;
+    my $list = shift;
+
+    if ($sth_client_select->execute($ip, $port) == 0) { 
+        $sth_client_insert->execute($ip, $port);
+        $sth_client_set->execute;
+    }
+    $sth_client_select->finish;
+    
+FILE:
+    for my $info (@$list) {
+        if ($debug & DBG_PRINTINFO) {
+            my $tmpfd = *STDOUT;
+            *STDOUT = *STDERR;
+            printInfo($info);
+            *STDOUT = $tmpfd;
+        }
+        my ($hash, $name, $size);
+        my $meta = $info->{Meta};
+        $hash   = $info->{Hash};
+        defined($name   = $meta->{Name}{Value}) or next;
+        defined($size   = $meta->{Size}{Value}) or next;
+
+        my ($type, $format);
+        $type   = $meta->{Type}{Value};
+        $format = $meta->{Format}{Value};
+
+        if ($sth_file_select->execute($hash, $size, $name) == 0) {
+            $sth_file_insert->execute($hash, $size, $name, $type, $format);
+            $sth_file_set->execute;
+        } else {
+            $sth_file_inc->execute;
+        }
+        $sth_file_select->finish;
+
+        $sth_link_insert->execute; 
+    }
+    $sth_file_count->execute;
+    $nFiles = $sth_file_count->fetchrow_array;
+    $sth_file_count->finish;
+}
+
+sub dbGetSources {
+    my $hash = shift;
+    my @sources = ();
+
+    if ($sth_get_sources->execute($hash) > 0) {
+        my ($cid, $ip, $port);
+        $sth_get_sources->bind_columns(undef, \$cid, \$ip, \$port);
+
+        my @cids;
+        while ($sth_get_sources->fetch) {
+            push @sources, $ip, $port;
+            push @cids, "cid = $cid";
+#            $sth_update_stamp->execute($cid);
+        }
+        if (@cids) {
+            my $sth = $dbh->prepare_cached('update client set last_used=null where ' 
+                                           . join(' and ', @cids));
+            $sth->execute;
+        }
+    }
+    $sth_get_sources->finish;
+    return \@sources;
+}
+
+sub dbSearchFile {
+    my $q = shift;
+    my $limit = shift;
+    
+    my $ok = 1;
+    my %fields = (Name => VT_STRING, Size => VT_INTEGER, 
+                  Type => VT_STRING, Format => VT_STRING);
+   
+    my $sqlexpr = makeSQLExpr($q, \$ok, \%fields);
+#    print STDERR "SQL($ok): $sqlexpr\n";
+   
+    my @res = ();
+
+    if ($ok) {
+        my $sth = $dbh->prepare_cached("select * from file where $sqlexpr order by availability desc"
+                                       . ($limit ? " limit $limit" : ''));
+        if ($sth->execute > 0) {
+            my ($fid, $hash, $size, $name, $type, $format, $navail);
+            $sth->bind_columns(undef, \$fid, \$hash, \$size, 
+                               \$name, \$type, \$format, \$navail);
+
+            while ($sth->fetch) {
+                my %meta;
+                tie %meta, "Tie::IxHash";
+                $meta{Name}   = makeMeta(TT_NAME, $name);
+                $meta{Size}   = makeMeta(TT_SIZE, $size);
+                $meta{Type}   = makeMeta(TT_TYPE, $type) if $type;
+                $meta{Format} = makeMeta(TT_FORMAT, $format) if $format;
+                $meta{Availability} = makeMeta(TT_AVAILABILITY, $navail);
+                my $info = {Hash => $hash, IP => 0, Port => 0, Meta => \%meta};
+                push @res, $info;
+                if ($debug & DBG_PRINTINFO) {
+                    my $tmpfd = *STDOUT;
+                    *STDOUT = *STDERR;
+                    printInfo($info);
+                    *STDOUT = $tmpfd;
+                }
+            }
+        }
+    }
+    return \@res;
+}
+
+sub dbRemove {
+    my $ip = shift;
+    my $port = shift;
+    $sth_file_dec->execute($ip, $port);
+    $sth_delete->execute($ip, $port);
+    $sth_file_count->execute;
+    $nFiles = $sth_file_count->fetchrow_array;
+    $sth_file_count->finish;
+}
+
+__END__
+
+=head1 NAME
+
+P2P::pDonkeyS - eDonkey server, based on C<Net::Server::Multiplex> with MySQL database.
+
+=head1 SYNOPSIS
+
+  mysql -u root -p <makedb.sql
+
+  pdonkeys --setsid=1 --log_file=/tmp/pdonkeys.log --pid_file=/tmp/pdonkeys.pid
+
+  pdonkeys --conf_file=pdonkeys.conf
+
+  kill `cat /tmp/pdonkeys.pid`
+
+  mysql -u root -p <dropdb.sql
+
+=head1 OBTAINING
+
+Visit L<http://sourceforge.net/projects/pdonkey/> for the latest version.
+
+=head1 FEATURES
+
+=over 2
+
+=item o
+MySQL file and client storage.
+
+=item o
+Multiplex server architecture.
+
+=item o
+Receive multiple F<server.met> files from URL.
+
+=back
+
+=head1 DESCRIPTION
+
+pDonkeyS is perl implementation of eDonkey server. It is built
+upon C<Net::Server::Multiplex> and utilizes the power of MySQL for storing, fetching
+and searching shares.
+
+The main goal of the server is to provide framework for 
+further eDonkey protocol exploration, but it could be usefull in testing of client software,
+since the server can be configured to output very detailed debug info about eDonkey
+traffic.
+
+=head1 ARGUMENTS
+
+There are two possible ways to pass arguments to C<pdonkeys>.
+They are I<passing on command line> or I<using a conf file>.
+C<pdonkeys> accepts all C<Net::Server> and C<Net::Server::Proto::UDP>
+arguments plus eDonkey specific arguments.
+
+While passing arguments to C<pdonkeys> on command line,
+arguments specified in form C<--argument=value>.
+
+While using configuration file, arguments specified in form
+C<argument value> or C<argument=value>. One argument per line.
+
+=head2 eDonkey Arguments
+
+=over 0
+
+=item name
+
+Name of server which will displayed in the server list of the clients.
+
+=item desc
+
+Description of server which will displayed in the server list of the clients.
+
+=item maxClients
+
+The maximum number of clients, connected to server. Default is 6000.
+
+=item thisIP
+
+The IP of this server. This is only needed if the server
+determines its own IP incorrectly. Default received from C<hostname()>.
+
+=item welcome
+
+The message that each client that logs on to the server will be sent.
+
+=item statusTimeout
+
+The interval between server status updates to clients. Defauls is 60.
+
+=item serverMet
+
+URL of F<server.met> file. Multiple options allowed. Server list updates from
+specified URLs at start and each C<serverListTimeout> seconds. Timeout is set to
+10 seconds. F<server.met> loads blocks the server, so if source don't response,
+there will be 10 seconds lag for each C<serverMet> argument.
+
+=item serverListTimeout
+
+The interval between server list updates on server. Default is 86400 - once a day.
+
+=head2 Database Access Arguments
+
+=item dbName
+
+The database source for C<DBI::connect()>. For details check L<DBI>.
+Default is "dbi:mysql:pDonkey".
+
+=item dbUser
+
+User to use for access to C<dbName>. Default is "pDonkeyS".
+
+=item dbAuth
+
+Password to use for access to C<dbName>. Default is "pDonkeySPass".
+
+=back
+
+=head1 TODO
+
+=over 2
+
+=item o
+Multiline string arguments (C<Net::Server> fix).
+
+=item o
+Filters on shared files ("filter").
+
+=item o
+Multiple port pairs (tcp/udp) via configuration file.
+
+=item o
+Proxy mode (work with other eDonkey servers as client).
+
+=item o
+Don't C<accept()> if server is full (C<Net::Server> fix).
+
+=item o
+Obtain F<server.met> "seedIP:seedPort" support.
+
+=item o
+"public" support.
+
+=item o
+Multiple C<pdonkeys> process instancies (mysql safe).
+
+=item o
+Administration port.
+
+=back
+
+=head1 SEE ALSO
+
+L<Net::Server>, L<Net::Server::Multiplex>, L<DBI>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2003 Alexey Klimkin <klimkin at cpan.org>.
+
+All rights reserved.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
